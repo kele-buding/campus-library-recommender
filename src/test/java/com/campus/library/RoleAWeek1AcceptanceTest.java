@@ -9,14 +9,17 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+import com.campus.library.dto.CheckinRequest;
 import com.campus.library.dto.CheckoutRequest;
 import com.campus.library.entity.Account;
+import com.campus.library.entity.AuditLog;
 import com.campus.library.entity.Book;
 import com.campus.library.entity.ClockSetting;
 import com.campus.library.entity.Loan;
 import com.campus.library.entity.Reservation;
 import com.campus.library.exception.ApiException;
 import com.campus.library.mapper.AccountMapper;
+import com.campus.library.mapper.AuditLogMapper;
 import com.campus.library.mapper.BookMapper;
 import com.campus.library.mapper.ClockSettingMapper;
 import com.campus.library.mapper.LoanMapper;
@@ -65,6 +68,8 @@ class RoleAWeek1AcceptanceTest {
     private SeedDatasetService seedDatasetService;
     @Autowired
     private AccountMapper accountMapper;
+    @Autowired
+    private AuditLogMapper auditLogMapper;
     @Autowired
     private BookMapper bookMapper;
     @Autowired
@@ -547,6 +552,248 @@ class RoleAWeek1AcceptanceTest {
                         ))))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.available_count").value(1));
+    }
+
+    // =========================================================================
+    // 回归测试：覆盖测试日志中暴露的 8 项缺陷（BUG-01 ~ BUG-08）
+    // =========================================================================
+
+    @Test
+    void regression_studentConvertedToBuyerPersistsNullMajorAndDisplayCode() throws Exception {
+        Account a1 = findAccount("a1");
+        MockHttpSession adminSession = login("sysadmin", DEFAULT_PWD);
+
+        mockMvc.perform(put("/api/admin/accounts/" + a1.getUserId())
+                        .session(adminSession)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(Map.of(
+                                "loginName", "a1",
+                                "role", "buyer",
+                                "isActive", true
+                        ))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.role").value("buyer"))
+                .andExpect(jsonPath("$.major_id").doesNotExist())
+                .andExpect(jsonPath("$.display_code").doesNotExist());
+
+        Account reloaded = accountMapper.selectById(a1.getUserId());
+        assertThat(reloaded.getRole()).isEqualTo(Account.ROLE_BUYER);
+        assertThat(reloaded.getMajorId()).isNull();
+        assertThat(reloaded.getDisplayCode()).isNull();
+    }
+
+    @Test
+    void regression_oversizedMajorCodeReturns400InvalidArgument() throws Exception {
+        MockHttpSession adminSession = login("sysadmin", DEFAULT_PWD);
+        String oversizedCode = "A".repeat(33);
+
+        mockMvc.perform(post("/api/admin/majors")
+                        .session(adminSession)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(Map.of(
+                                "code", oversizedCode,
+                                "name", "超长测试专业"
+                        ))))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error_code").value("INVALID_ARGUMENT"));
+    }
+
+    @Test
+    void regression_tenConcurrentCheckoutsForLastCopyReturnOneOkAndNineOutOfStock() throws Exception {
+        List<Account> students = new ArrayList<>(accountMapper.selectList(
+                Wrappers.<Account>lambdaQuery().eq(Account::getRole, Account.ROLE_STUDENT)));
+        Account template = students.get(0);
+        for (int i = students.size() + 1; i <= 10; i++) {
+            Account extra = new Account();
+            extra.setLoginName("extra_student_" + i);
+            extra.setPasswordHash(template.getPasswordHash());
+            extra.setRole(Account.ROLE_STUDENT);
+            extra.setMajorId(template.getMajorId());
+            extra.setDisplayCode("E" + i);
+            extra.setIsActive(Boolean.TRUE);
+            accountMapper.insert(extra);
+            students.add(extra);
+        }
+        int concurrency = 10;
+        ExecutorService pool = Executors.newFixedThreadPool(concurrency);
+        CountDownLatch ready = new CountDownLatch(concurrency);
+        CountDownLatch start = new CountDownLatch(1);
+
+        try {
+            List<Future<String>> futures = new ArrayList<>();
+            for (int i = 0; i < concurrency; i++) {
+                Account student = students.get(i);
+                AuthService.AuthContext ctx = toAuthContext(student);
+                UUID reqId = UUID.randomUUID();
+                futures.add(pool.submit(() -> {
+                    ready.countDown();
+                    start.await();
+                    try {
+                        circulationService.checkout(ctx, new CheckoutRequest(115L, null, reqId));
+                        return "OK";
+                    } catch (ApiException ex) {
+                        return ex.getErrorCode();
+                    }
+                }));
+            }
+
+            ready.await();
+            start.countDown();
+
+            List<String> outcomes = new ArrayList<>();
+            for (Future<String> f : futures) {
+                outcomes.add(f.get());
+            }
+
+            assertThat(outcomes).containsOnly("OK", "OUT_OF_STOCK");
+            assertThat(outcomes.stream().filter("OK"::equals).count()).isEqualTo(1L);
+            assertThat(outcomes.stream().filter("OUT_OF_STOCK"::equals).count()).isEqualTo(9L);
+
+            Book b115 = bookMapper.selectById(115L);
+            assertThat(b115.getAvailableCount()).isEqualTo(0);
+            assertThat(b115.getVersion()).isEqualTo(2L);
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void regression_concurrentCrossBookSameRequestIdReturnsRequestIdConflict() throws Exception {
+        Account a4 = findAccount("a4");
+        AuthService.AuthContext ctxA4 = toAuthContext(a4);
+        UUID sharedReqId = UUID.randomUUID();
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch start = new CountDownLatch(1);
+        try {
+            Future<Object> f1 = pool.submit(() -> {
+                ready.countDown();
+                start.await();
+                try {
+                    return circulationService.checkout(ctxA4, new CheckoutRequest(101L, null, sharedReqId));
+                } catch (Throwable t) {
+                    return t;
+                }
+            });
+            Future<Object> f2 = pool.submit(() -> {
+                ready.countDown();
+                start.await();
+                try {
+                    return circulationService.checkout(ctxA4, new CheckoutRequest(103L, null, sharedReqId));
+                } catch (Throwable t) {
+                    return t;
+                }
+            });
+
+            ready.await();
+            start.countDown();
+
+            Object r1 = f1.get();
+            Object r2 = f2.get();
+            List<Object> results = List.of(r1, r2);
+
+            long okCount = results.stream().filter(Map.class::isInstance).count();
+            List<Throwable> errors = results.stream()
+                    .filter(Throwable.class::isInstance)
+                    .map(Throwable.class::cast)
+                    .toList();
+
+            assertThat(okCount).isEqualTo(1L);
+            assertThat(errors).hasSize(1);
+            assertThat(errors.get(0)).isInstanceOf(ApiException.class);
+            assertThat(((ApiException) errors.get(0)).getErrorCode()).isEqualTo("REQUEST_ID_CONFLICT");
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void regression_forbiddenCheckoutPersistsOwnershipDenialAuditLog() {
+        Account a1 = findAccount("a1");
+        Account a2 = findAccount("a2");
+        AuthService.AuthContext ctxA1 = toAuthContext(a1);
+
+        long beforeLogs = auditLogMapper.selectCount(
+                Wrappers.<AuditLog>lambdaQuery()
+                        .eq(AuditLog::getActorId, a1.getUserId())
+                        .eq(AuditLog::getOutcome, "ownership_denied"));
+
+        try {
+            circulationService.checkout(ctxA1, new CheckoutRequest(115L, a2.getUserId(), UUID.randomUUID()));
+            throw new AssertionError("Expected FORBIDDEN");
+        } catch (ApiException ex) {
+            assertThat(ex.getErrorCode()).isEqualTo("FORBIDDEN");
+        }
+
+        long afterLogs = auditLogMapper.selectCount(
+                Wrappers.<AuditLog>lambdaQuery()
+                        .eq(AuditLog::getActorId, a1.getUserId())
+                        .eq(AuditLog::getOutcome, "ownership_denied"));
+        assertThat(afterLogs).isEqualTo(beforeLogs + 1);
+    }
+
+    @Test
+    void regression_concurrentCheckinWithDifferentRequestIdsOnlySucceedsOnce() throws Exception {
+        Account a1 = findAccount("a1");
+        AuthService.AuthContext ctxA1 = toAuthContext(a1);
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch start = new CountDownLatch(1);
+        try {
+            Future<Object> f1 = pool.submit(() -> {
+                ready.countDown();
+                start.await();
+                try {
+                    return circulationService.checkin(ctxA1, new CheckinRequest(2L, UUID.randomUUID()));
+                } catch (Throwable t) {
+                    return t;
+                }
+            });
+            Future<Object> f2 = pool.submit(() -> {
+                ready.countDown();
+                start.await();
+                try {
+                    return circulationService.checkin(ctxA1, new CheckinRequest(2L, UUID.randomUUID()));
+                } catch (Throwable t) {
+                    return t;
+                }
+            });
+
+            ready.await();
+            start.countDown();
+
+            List<Object> results = List.of(f1.get(), f2.get());
+            long okCount = results.stream().filter(Map.class::isInstance).count();
+            List<Throwable> errors = results.stream()
+                    .filter(Throwable.class::isInstance)
+                    .map(Throwable.class::cast)
+                    .toList();
+
+            assertThat(okCount).isEqualTo(1L);
+            assertThat(errors).hasSize(1);
+            assertThat(errors.get(0)).isInstanceOf(ApiException.class);
+            assertThat(((ApiException) errors.get(0)).getErrorCode()).isEqualTo("LOAN_ALREADY_RETURNED");
+
+            Book b102 = bookMapper.selectById(102L);
+            assertThat(b102.getAvailableCount()).isEqualTo(3);
+            assertThat(b102.getVersion()).isEqualTo(2L);
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void regression_seedLeavesNextLoanIdAvailable() {
+        Account a4 = findAccount("a4");
+        Loan loan = new Loan();
+        loan.setStudentId(a4.getUserId());
+        loan.setBookId(115L);
+        loan.setBorrowedOn(LocalDate.of(2026, 11, 20));
+        loan.setDueOn(LocalDate.of(2026, 12, 4));
+        loanMapper.insert(loan);
+        assertThat(loan.getLoanId()).isGreaterThan(17L);
     }
 
     private MockHttpSession login(String loginName, String password) throws Exception {

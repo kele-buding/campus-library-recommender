@@ -36,6 +36,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import javax.sql.DataSource;
+import org.springframework.jdbc.core.ConnectionCallback;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
@@ -486,10 +487,8 @@ public class SeedDatasetService {
     }
 
     private String detectDatabaseProductName() {
-        try (Connection conn = dataSource.getConnection()) {
-            return conn.getMetaData().getDatabaseProductName().toLowerCase();
-        } catch (Exception e) {
-            return "";
-        }
+        String name = jdbcTemplate.execute((ConnectionCallback<String>) conn ->
+                conn.getMetaData().getDatabaseProductName().toLowerCase());
+        return name != null ? name : "";
     }
 }

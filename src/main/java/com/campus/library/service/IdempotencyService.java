@@ -5,7 +5,6 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.sql.Connection;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.HexFormat;
@@ -13,8 +12,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
-import javax.sql.DataSource;
 import org.springframework.http.HttpStatus;
+import org.springframework.jdbc.core.ConnectionCallback;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
@@ -25,7 +24,7 @@ import org.springframework.stereotype.Service;
  * - 参数摘要一致：直接复用并返回先前成功响应；
  * - 参数摘要不同：拒绝并提示 REQUEST_ID_CONFLICT。
  *
- * 读写均通过 JdbcTemplate 显式绑定 UUID 参数并读取文本响应，确保 PostgreSQL (UUID/JSONB) 与 H2 (UUID/CLOB) 一致兼容。
+ * 读写均通过 JdbcTemplate 复用当前事务连接，且数据库方言探测结果缓存复用，避免在并发事务内额外借用连接池连接。
  */
 @Service
 public class IdempotencyService {
@@ -35,16 +34,14 @@ public class IdempotencyService {
     private record ReceiptRow(String payloadHash, String responseJson) {}
 
     private final JdbcTemplate jdbcTemplate;
-    private final DataSource dataSource;
     private final ObjectMapper objectMapper;
+    private volatile Boolean postgres;
 
     public IdempotencyService(
             JdbcTemplate jdbcTemplate,
-            DataSource dataSource,
             ObjectMapper objectMapper
     ) {
         this.jdbcTemplate = jdbcTemplate;
-        this.dataSource = dataSource;
         this.objectMapper = objectMapper;
     }
 
@@ -124,10 +121,14 @@ public class IdempotencyService {
     }
 
     private boolean isPostgres() {
-        try (Connection conn = dataSource.getConnection()) {
-            return conn.getMetaData().getDatabaseProductName().toLowerCase().contains("postgresql");
-        } catch (Exception e) {
-            return false;
+        Boolean cached = this.postgres;
+        if (cached != null) {
+            return cached;
         }
+        Boolean detected = jdbcTemplate.execute((ConnectionCallback<Boolean>) conn ->
+                conn.getMetaData().getDatabaseProductName().toLowerCase().contains("postgresql"));
+        boolean value = Boolean.TRUE.equals(detected);
+        this.postgres = value;
+        return value;
     }
 }

@@ -199,7 +199,8 @@ public class AuthService {
         }
 
         String loginName = req.loginName().trim();
-        String displayCode = (req.displayCode() != null && !req.displayCode().isBlank())
+        String displayCode = Account.ROLE_STUDENT.equals(role)
+                && req.displayCode() != null && !req.displayCode().isBlank()
                 ? req.displayCode().trim()
                 : null;
 
@@ -236,17 +237,29 @@ public class AuthService {
             if (target == null) {
                 throw new ApiException(HttpStatus.NOT_FOUND, "ACCOUNT_NOT_FOUND", "目标账号不存在");
             }
+            String newPasswordHash = (req.password() != null && !req.password().isBlank())
+                    ? passwordEncoder.encode(req.password())
+                    : target.getPasswordHash();
+            boolean newIsActive = req.isActive() != null ? req.isActive() : Boolean.TRUE.equals(target.getIsActive());
+
+            // 显式更新含 null 字段（如学生转为非学生角色时清空 major_id 与 display_code），避免 MyBatis-Plus 忽略 null
+            accountMapper.update(
+                    null,
+                    Wrappers.<Account>lambdaUpdate()
+                            .eq(Account::getUserId, userId)
+                            .set(Account::getLoginName, loginName)
+                            .set(Account::getPasswordHash, newPasswordHash)
+                            .set(Account::getRole, role)
+                            .set(Account::getMajorId, majorId)
+                            .set(Account::getDisplayCode, displayCode)
+                            .set(Account::getIsActive, newIsActive)
+            );
             target.setLoginName(loginName);
-            if (req.password() != null && !req.password().isBlank()) {
-                target.setPasswordHash(passwordEncoder.encode(req.password()));
-            }
+            target.setPasswordHash(newPasswordHash);
             target.setRole(role);
             target.setMajorId(majorId);
             target.setDisplayCode(displayCode);
-            if (req.isActive() != null) {
-                target.setIsActive(req.isActive());
-            }
-            accountMapper.updateById(target);
+            target.setIsActive(newIsActive);
             auditAction = "update_account";
         }
 

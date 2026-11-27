@@ -1,6 +1,7 @@
 package com.campus.library.service;
 
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+import com.campus.library.config.AppProperties;
 import com.campus.library.dto.CheckinRequest;
 import com.campus.library.dto.CheckoutRequest;
 import com.campus.library.dto.ReservationRequest;
@@ -23,18 +24,22 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
+import java.util.function.Supplier;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * DU-03 借出与归还事务 + DU-04 预约与取消事务（MOD-02 / INT-02）。
  *
  * 事务与锁顺序：
- * 1. 先检查幂等回执 request_receipt（同键同参复用，同键异参报错）；
- * 2. 统一按 book_id 加排他行锁（SELECT ... FOR UPDATE）；
- * 3. 在同一数据库事务内校验状态、更新库存/记录/版本并写入回执与审计日志；
- * 4. 任何业务校验或写入失败整体回滚。
+ * 1. 事务外完成归属校验（越权拒绝审计日志独立落库，不随业务事务回滚，也不额外占用第二条连接）；
+ * 2. 快速检查幂等回执 request_receipt（同键同参复用，同键异参报错）；
+ * 3. 在编程式事务内统一按 book_id 加排他行锁（SELECT ... FOR UPDATE），二次核对回执后完成校验与原子更新；
+ * 4. 若并发跨书请求撞 request_receipt 唯一约束（DuplicateKeyException），原事务自动回滚后重新核对回执：
+ *    参数一致复用原回执，参数不同返回 409 REQUEST_ID_CONFLICT。
  */
 @Service
 public class CirculationService {
@@ -50,6 +55,8 @@ public class CirculationService {
     private final ClockSettingMapper clockSettingMapper;
     private final IdempotencyService idempotencyService;
     private final AuthService authService;
+    private final AppProperties appProperties;
+    private final TransactionTemplate transactionTemplate;
 
     public CirculationService(
             BookMapper bookMapper,
@@ -58,7 +65,9 @@ public class CirculationService {
             AccountMapper accountMapper,
             ClockSettingMapper clockSettingMapper,
             IdempotencyService idempotencyService,
-            AuthService authService
+            AuthService authService,
+            AppProperties appProperties,
+            TransactionTemplate transactionTemplate
     ) {
         this.bookMapper = bookMapper;
         this.loanMapper = loanMapper;
@@ -67,12 +76,13 @@ public class CirculationService {
         this.clockSettingMapper = clockSettingMapper;
         this.idempotencyService = idempotencyService;
         this.authService = authService;
+        this.appProperties = appProperties;
+        this.transactionTemplate = transactionTemplate;
     }
 
     /**
      * DU-03 借出：学生本人借阅或图书馆管理员代办。
      */
-    @Transactional
     public Map<String, Object> checkout(AuthService.AuthContext actor, CheckoutRequest req) {
         String reqIdStr = req.requestId().toString();
         Long targetStudentId = resolveTargetStudent(actor, req.studentId(), reqIdStr);
@@ -85,69 +95,78 @@ public class CirculationService {
             return cached.get();
         }
 
-        Book lockedBook = bookMapper.selectByIdForUpdate(req.bookId());
-        if (lockedBook == null) {
-            throw new ApiException(HttpStatus.NOT_FOUND, "BOOK_NOT_FOUND", "书目不存在", reqIdStr);
-        }
+        return executeIdempotentTransaction(
+                actor.actorId(),
+                "checkout",
+                req.requestId(),
+                payloadHash,
+                () -> {
+                    Book lockedBook = bookMapper.selectByIdForUpdate(req.bookId());
+                    if (lockedBook == null) {
+                        throw new ApiException(HttpStatus.NOT_FOUND, "BOOK_NOT_FOUND", "书目不存在", reqIdStr);
+                    }
 
-        // 获取书目行锁后二次核对幂等回执，确保并发同 request_id 重放直接复用已提交结果
-        Optional<Map<String, Object>> cachedAfterLock = idempotencyService.findExistingResponse(
-                actor.actorId(), "checkout", req.requestId(), payloadHash);
-        if (cachedAfterLock.isPresent()) {
-            return cachedAfterLock.get();
-        }
+                    // 获取书目行锁后二次核对幂等回执，确保并发同 request_id 重放直接复用已提交结果
+                    Optional<Map<String, Object>> cachedAfterLock = idempotencyService.findExistingResponse(
+                            actor.actorId(), "checkout", req.requestId(), payloadHash);
+                    if (cachedAfterLock.isPresent()) {
+                        return cachedAfterLock.get();
+                    }
 
-        // 校验同一学生同一书目无在借记录
-        long activeSameBook = loanMapper.selectCount(
-                Wrappers.<Loan>lambdaQuery()
-                        .eq(Loan::getStudentId, targetStudentId)
-                        .eq(Loan::getBookId, req.bookId())
-                        .isNull(Loan::getReturnedOn)
+                    // 校验同一学生同一书目无在借记录
+                    long activeSameBook = loanMapper.selectCount(
+                            Wrappers.<Loan>lambdaQuery()
+                                    .eq(Loan::getStudentId, targetStudentId)
+                                    .eq(Loan::getBookId, req.bookId())
+                                    .isNull(Loan::getReturnedOn)
+                    );
+                    if (activeSameBook > 0) {
+                        throw new ApiException(HttpStatus.CONFLICT, "ALREADY_BORROWED", "该图书正在借阅中，不可重复借出", reqIdStr);
+                    }
+
+                    if (lockedBook.getAvailableCount() == null || lockedBook.getAvailableCount() < 1) {
+                        throw new ApiException(HttpStatus.CONFLICT, "OUT_OF_STOCK", "暂无可借图书", reqIdStr);
+                    }
+
+                    int updated = bookMapper.decrementAvailableAndBumpVersion(req.bookId());
+                    if (updated != 1) {
+                        throw new ApiException(HttpStatus.CONFLICT, "OUT_OF_STOCK", "暂无可借图书", reqIdStr);
+                    }
+
+                    LocalDate today = readBusinessDate();
+                    LocalDate dueOn = today.plusDays(LOAN_PERIOD_DAYS);
+
+                    Loan loan = new Loan();
+                    loan.setStudentId(targetStudentId);
+                    loan.setBookId(req.bookId());
+                    loan.setBorrowedOn(today);
+                    loan.setDueOn(dueOn);
+                    loan.setReturnedOn(null);
+                    loanMapper.insert(loan);
+
+                    Book refreshed = bookMapper.selectById(req.bookId());
+
+                    Map<String, Object> result = new LinkedHashMap<>();
+                    result.put("loan_id", loan.getLoanId());
+                    result.put("book_id", req.bookId());
+                    result.put("student_id", targetStudentId);
+                    result.put("borrowed_on", today.toString());
+                    result.put("due_on", dueOn.toString());
+                    result.put("available_count", refreshed.getAvailableCount());
+                    result.put("version", refreshed.getVersion());
+
+                    idempotencyService.saveReceipt(actor.actorId(), "checkout", req.requestId(), payloadHash, result);
+                    authService.recordAudit(actor.actorId(), "checkout", "loan:" + loan.getLoanId(), "success");
+                    return result;
+                },
+                "ALREADY_BORROWED",
+                "该图书正在借阅中，不可重复借出"
         );
-        if (activeSameBook > 0) {
-            throw new ApiException(HttpStatus.CONFLICT, "ALREADY_BORROWED", "该图书正在借阅中，不可重复借出", reqIdStr);
-        }
-
-        if (lockedBook.getAvailableCount() == null || lockedBook.getAvailableCount() < 1) {
-            throw new ApiException(HttpStatus.CONFLICT, "OUT_OF_STOCK", "暂无可借图书", reqIdStr);
-        }
-
-        int updated = bookMapper.decrementAvailableAndBumpVersion(req.bookId());
-        if (updated != 1) {
-            throw new ApiException(HttpStatus.CONFLICT, "OUT_OF_STOCK", "暂无可借图书", reqIdStr);
-        }
-
-        LocalDate today = readBusinessDate();
-        LocalDate dueOn = today.plusDays(LOAN_PERIOD_DAYS);
-
-        Loan loan = new Loan();
-        loan.setStudentId(targetStudentId);
-        loan.setBookId(req.bookId());
-        loan.setBorrowedOn(today);
-        loan.setDueOn(dueOn);
-        loan.setReturnedOn(null);
-        loanMapper.insert(loan);
-
-        Book refreshed = bookMapper.selectById(req.bookId());
-
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("loan_id", loan.getLoanId());
-        result.put("book_id", req.bookId());
-        result.put("student_id", targetStudentId);
-        result.put("borrowed_on", today.toString());
-        result.put("due_on", dueOn.toString());
-        result.put("available_count", refreshed.getAvailableCount());
-        result.put("version", refreshed.getVersion());
-
-        idempotencyService.saveReceipt(actor.actorId(), "checkout", req.requestId(), payloadHash, result);
-        authService.recordAudit(actor.actorId(), "checkout", "loan:" + loan.getLoanId(), "success");
-        return result;
     }
 
     /**
      * DU-03 归还：仅办理在借记录，标记 returned_on 并恢复 1 册库存。
      */
-    @Transactional
     public Map<String, Object> checkin(AuthService.AuthContext actor, CheckinRequest req) {
         String reqIdStr = req.requestId().toString();
 
@@ -158,70 +177,84 @@ public class CirculationService {
             return cached.get();
         }
 
+        // 在事务外预查借阅记录并做学生归属校验，确保越权审计独立落库且不污染事务一级缓存
         Loan initialLoan = loanMapper.selectById(req.loanId());
         if (initialLoan == null) {
             throw new ApiException(HttpStatus.NOT_FOUND, "LOAN_NOT_FOUND", "借阅记录不存在", reqIdStr);
         }
-
-        // 学生只能归还本人借阅
         if (Account.ROLE_STUDENT.equals(actor.role()) && !actor.actorId().equals(initialLoan.getStudentId())) {
             authService.recordAudit(actor.actorId(), "checkin", "loan:" + req.loanId(), "ownership_denied");
             throw new ApiException(HttpStatus.FORBIDDEN, "FORBIDDEN", "无权归还他人的借阅记录", reqIdStr);
         }
 
-        // 统一先锁书目，再二次核对幂等回执并重读借阅记录防止并发重复归还
-        Book lockedBook = bookMapper.selectByIdForUpdate(initialLoan.getBookId());
-        if (lockedBook == null) {
-            throw new ApiException(HttpStatus.NOT_FOUND, "BOOK_NOT_FOUND", "关联书目不存在", reqIdStr);
-        }
+        return executeIdempotentTransaction(
+                actor.actorId(),
+                "checkin",
+                req.requestId(),
+                payloadHash,
+                () -> {
+                    // 统一先锁书目，再二次核对幂等回执并加锁重读借阅记录防止并发重复归还
+                    Book lockedBook = bookMapper.selectByIdForUpdate(initialLoan.getBookId());
+                    if (lockedBook == null) {
+                        throw new ApiException(HttpStatus.NOT_FOUND, "BOOK_NOT_FOUND", "关联书目不存在", reqIdStr);
+                    }
 
-        Optional<Map<String, Object>> cachedAfterLock = idempotencyService.findExistingResponse(
-                actor.actorId(), "checkin", req.requestId(), payloadHash);
-        if (cachedAfterLock.isPresent()) {
-            return cachedAfterLock.get();
-        }
+                    Optional<Map<String, Object>> cachedAfterLock = idempotencyService.findExistingResponse(
+                            actor.actorId(), "checkin", req.requestId(), payloadHash);
+                    if (cachedAfterLock.isPresent()) {
+                        return cachedAfterLock.get();
+                    }
 
-        Loan loan = loanMapper.selectById(req.loanId());
-        if (loan.getReturnedOn() != null) {
-            throw new ApiException(HttpStatus.CONFLICT, "LOAN_ALREADY_RETURNED", "该借阅记录已归还，不可重复办理", reqIdStr);
-        }
+                    Loan loan = loanMapper.selectByIdForUpdate(req.loanId());
+                    if (loan == null) {
+                        throw new ApiException(HttpStatus.NOT_FOUND, "LOAN_NOT_FOUND", "借阅记录不存在", reqIdStr);
+                    }
+                    if (loan.getReturnedOn() != null) {
+                        throw new ApiException(HttpStatus.CONFLICT, "LOAN_ALREADY_RETURNED", "该借阅记录已归还，不可重复办理", reqIdStr);
+                    }
 
-        LocalDate today = readBusinessDate();
-        if (today.isBefore(loan.getBorrowedOn())) {
-            throw new ApiException(
-                    HttpStatus.CONFLICT,
-                    "CLOCK_BEFORE_BORROW_DATE",
-                    "当前业务日期早于借出日期，请调整模拟时钟后再办理归还",
-                    reqIdStr
-            );
-        }
+                    LocalDate today = readBusinessDate();
+                    if (today.isBefore(loan.getBorrowedOn())) {
+                        throw new ApiException(
+                                HttpStatus.CONFLICT,
+                                "CLOCK_BEFORE_BORROW_DATE",
+                                "当前业务日期早于借出日期，请调整模拟时钟后再办理归还",
+                                reqIdStr
+                        );
+                    }
 
-        loan.setReturnedOn(today);
-        loanMapper.updateById(loan);
+                    // 原子条件更新：仅当 returned_on IS NULL 时生效，彻底防止并发重复归还
+                    int marked = loanMapper.markReturnedIfActive(loan.getLoanId(), today);
+                    if (marked != 1) {
+                        throw new ApiException(HttpStatus.CONFLICT, "LOAN_ALREADY_RETURNED", "该借阅记录已归还，不可重复办理", reqIdStr);
+                    }
 
-        int updated = bookMapper.incrementAvailableAndBumpVersion(loan.getBookId());
-        if (updated != 1) {
-            throw new ApiException(HttpStatus.CONFLICT, "INVENTORY_OVERFLOW", "库存恢复失败，请核对馆藏总数", reqIdStr);
-        }
+                    int updated = bookMapper.incrementAvailableAndBumpVersion(loan.getBookId());
+                    if (updated != 1) {
+                        throw new ApiException(HttpStatus.CONFLICT, "INVENTORY_OVERFLOW", "库存恢复失败，请核对馆藏总数", reqIdStr);
+                    }
 
-        Book refreshed = bookMapper.selectById(loan.getBookId());
+                    Book refreshed = bookMapper.selectById(loan.getBookId());
 
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("loan_id", loan.getLoanId());
-        result.put("book_id", loan.getBookId());
-        result.put("returned_on", today.toString());
-        result.put("available_count", refreshed.getAvailableCount());
-        result.put("version", refreshed.getVersion());
+                    Map<String, Object> result = new LinkedHashMap<>();
+                    result.put("loan_id", loan.getLoanId());
+                    result.put("book_id", loan.getBookId());
+                    result.put("returned_on", today.toString());
+                    result.put("available_count", refreshed.getAvailableCount());
+                    result.put("version", refreshed.getVersion());
 
-        idempotencyService.saveReceipt(actor.actorId(), "checkin", req.requestId(), payloadHash, result);
-        authService.recordAudit(actor.actorId(), "checkin", "loan:" + loan.getLoanId(), "success");
-        return result;
+                    idempotencyService.saveReceipt(actor.actorId(), "checkin", req.requestId(), payloadHash, result);
+                    authService.recordAudit(actor.actorId(), "checkin", "loan:" + loan.getLoanId(), "success");
+                    return result;
+                },
+                "LOAN_ALREADY_RETURNED",
+                "该借阅记录已归还，不可重复办理"
+        );
     }
 
     /**
      * DU-04 预约与取消：按学生去重，仅状态实际变化时递增 book.version，库存始终不变。
      */
-    @Transactional
     public Map<String, Object> setReservation(AuthService.AuthContext actor, ReservationRequest req) {
         String reqIdStr = req.requestId().toString();
         Long targetStudentId = resolveTargetStudent(actor, req.studentId(), reqIdStr);
@@ -234,70 +267,80 @@ public class CirculationService {
             return cached.get();
         }
 
-        Book lockedBook = bookMapper.selectByIdForUpdate(req.bookId());
-        if (lockedBook == null) {
-            throw new ApiException(HttpStatus.NOT_FOUND, "BOOK_NOT_FOUND", "书目不存在", reqIdStr);
-        }
-
-        // 获取书目行锁后二次核对幂等回执
-        Optional<Map<String, Object>> cachedAfterLock = idempotencyService.findExistingResponse(
-                actor.actorId(), "reserve", req.requestId(), payloadHash);
-        if (cachedAfterLock.isPresent()) {
-            return cachedAfterLock.get();
-        }
-
-        Reservation activeRes = reservationMapper.selectOne(
-                Wrappers.<Reservation>lambdaQuery()
-                        .eq(Reservation::getStudentId, targetStudentId)
-                        .eq(Reservation::getBookId, req.bookId())
-                        .isNull(Reservation::getCancelledAt)
-        );
-
-        Long reservationId;
-        if (Boolean.TRUE.equals(req.active())) {
-            if (activeRes != null) {
-                throw new ApiException(HttpStatus.CONFLICT, "ALREADY_RESERVED", "已有该图书的有效预约", reqIdStr);
-            }
-            Reservation created = new Reservation();
-            created.setStudentId(targetStudentId);
-            created.setBookId(req.bookId());
-            created.setCreatedAt(OffsetDateTime.now(SHANGHAI_OFFSET));
-            created.setCancelledAt(null);
-            reservationMapper.insert(created);
-            reservationId = created.getReservationId();
-        } else {
-            if (activeRes == null) {
-                throw new ApiException(HttpStatus.CONFLICT, "RESERVATION_NOT_FOUND", "当前无该图书的有效预约", reqIdStr);
-            }
-            activeRes.setCancelledAt(OffsetDateTime.now(SHANGHAI_OFFSET));
-            reservationMapper.updateById(activeRes);
-            reservationId = activeRes.getReservationId();
-        }
-
-        bookMapper.bumpVersionOnly(req.bookId());
-        Book refreshed = bookMapper.selectById(req.bookId());
-        long reservationCount = reservationMapper.selectCount(
-                Wrappers.<Reservation>lambdaQuery()
-                        .eq(Reservation::getBookId, req.bookId())
-                        .isNull(Reservation::getCancelledAt)
-        );
-
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("reservation_id", reservationId);
-        result.put("book_id", req.bookId());
-        result.put("active", req.active());
-        result.put("reservation_count", reservationCount);
-        result.put("available_count", refreshed.getAvailableCount());
-        result.put("version", refreshed.getVersion());
-
-        idempotencyService.saveReceipt(actor.actorId(), "reserve", req.requestId(), payloadHash, result);
-        authService.recordAudit(
+        return executeIdempotentTransaction(
                 actor.actorId(),
-                Boolean.TRUE.equals(req.active()) ? "reserve_create" : "reserve_cancel",
-                "reservation:" + reservationId,
-                "success"
+                "reserve",
+                req.requestId(),
+                payloadHash,
+                () -> {
+                    Book lockedBook = bookMapper.selectByIdForUpdate(req.bookId());
+                    if (lockedBook == null) {
+                        throw new ApiException(HttpStatus.NOT_FOUND, "BOOK_NOT_FOUND", "书目不存在", reqIdStr);
+                    }
+
+                    // 获取书目行锁后二次核对幂等回执
+                    Optional<Map<String, Object>> cachedAfterLock = idempotencyService.findExistingResponse(
+                            actor.actorId(), "reserve", req.requestId(), payloadHash);
+                    if (cachedAfterLock.isPresent()) {
+                        return cachedAfterLock.get();
+                    }
+
+                    Reservation activeRes = reservationMapper.selectOne(
+                            Wrappers.<Reservation>lambdaQuery()
+                                    .eq(Reservation::getStudentId, targetStudentId)
+                                    .eq(Reservation::getBookId, req.bookId())
+                                    .isNull(Reservation::getCancelledAt)
+                    );
+
+                    Long reservationId;
+                    if (Boolean.TRUE.equals(req.active())) {
+                        if (activeRes != null) {
+                            throw new ApiException(HttpStatus.CONFLICT, "ALREADY_RESERVED", "已有该图书的有效预约", reqIdStr);
+                        }
+                        Reservation created = new Reservation();
+                        created.setStudentId(targetStudentId);
+                        created.setBookId(req.bookId());
+                        created.setCreatedAt(OffsetDateTime.now(SHANGHAI_OFFSET));
+                        created.setCancelledAt(null);
+                        reservationMapper.insert(created);
+                        reservationId = created.getReservationId();
+                    } else {
+                        if (activeRes == null) {
+                            throw new ApiException(HttpStatus.CONFLICT, "RESERVATION_NOT_FOUND", "当前无该图书的有效预约", reqIdStr);
+                        }
+                        activeRes.setCancelledAt(OffsetDateTime.now(SHANGHAI_OFFSET));
+                        reservationMapper.updateById(activeRes);
+                        reservationId = activeRes.getReservationId();
+                    }
+
+                    bookMapper.bumpVersionOnly(req.bookId());
+                    Book refreshed = bookMapper.selectById(req.bookId());
+                    long reservationCount = reservationMapper.selectCount(
+                            Wrappers.<Reservation>lambdaQuery()
+                                    .eq(Reservation::getBookId, req.bookId())
+                                    .isNull(Reservation::getCancelledAt)
+                    );
+
+                    Map<String, Object> result = new LinkedHashMap<>();
+                    result.put("reservation_id", reservationId);
+                    result.put("book_id", req.bookId());
+                    result.put("active", req.active());
+                    result.put("reservation_count", reservationCount);
+                    result.put("available_count", refreshed.getAvailableCount());
+                    result.put("version", refreshed.getVersion());
+
+                    idempotencyService.saveReceipt(actor.actorId(), "reserve", req.requestId(), payloadHash, result);
+                    authService.recordAudit(
+                            actor.actorId(),
+                            Boolean.TRUE.equals(req.active()) ? "reserve_create" : "reserve_cancel",
+                            "reservation:" + reservationId,
+                            "success"
+                    );
+                    return result;
+                },
+                "ALREADY_RESERVED",
+                "已有该图书的有效预约"
         );
-        return result;
     }
 
     /**
@@ -349,6 +392,30 @@ public class CirculationService {
                 .toList();
     }
 
+    private Map<String, Object> executeIdempotentTransaction(
+            Long actorId,
+            String operation,
+            UUID requestId,
+            String payloadHash,
+            Supplier<Map<String, Object>> txBody,
+            String fallbackConflictCode,
+            String fallbackConflictMsg
+    ) {
+        try {
+            return transactionTemplate.execute(status -> txBody.get());
+        } catch (DuplicateKeyException dupEx) {
+            // 事务已自动回滚；在干净连接上复核是否命中 request_receipt 唯一约束：
+            // - 同键同参 -> 返回原成功回执
+            // - 同键异参 -> findExistingResponse 抛出 409 REQUEST_ID_CONFLICT
+            Optional<Map<String, Object>> existing = idempotencyService.findExistingResponse(
+                    actorId, operation, requestId, payloadHash);
+            if (existing.isPresent()) {
+                return existing.get();
+            }
+            throw new ApiException(HttpStatus.CONFLICT, fallbackConflictCode, fallbackConflictMsg, requestId.toString());
+        }
+    }
+
     private Long resolveTargetStudent(AuthService.AuthContext actor, Long requestedStudentId, String requestId) {
         if (Account.ROLE_STUDENT.equals(actor.role())) {
             if (requestedStudentId != null && !actor.actorId().equals(requestedStudentId)) {
@@ -371,9 +438,11 @@ public class CirculationService {
     }
 
     private LocalDate readBusinessDate() {
-        ClockSetting clock = clockSettingMapper.selectById((short) 1);
-        if (clock != null && clock.getSimDate() != null) {
-            return clock.getSimDate();
+        if (appProperties.isExperimentalClockEnabled()) {
+            ClockSetting clock = clockSettingMapper.selectById((short) 1);
+            if (clock != null && clock.getSimDate() != null) {
+                return clock.getSimDate();
+            }
         }
         return LocalDate.now(SHANGHAI_ZONE);
     }
