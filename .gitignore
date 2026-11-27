@@ -1,0 +1,23 @@
+# Maven / Java
+target/
+*.class
+*.jar
+*.war
+*.log
+
+# Local H2 database files
+data/
+
+# Environment & Secrets (NEVER commit real keys)
+.env
+.env.local
+.env.*.local
+
+# OS / IDE
+.DS_Store
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/

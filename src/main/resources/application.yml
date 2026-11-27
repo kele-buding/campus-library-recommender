@@ -1,0 +1,26 @@
+server:
+  port: ${SERVER_PORT:8080}
+
+spring:
+  application:
+    name: campus-library-recommender
+  profiles:
+    default: h2
+  jackson:
+    time-zone: Asia/Shanghai
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    banner: false
+
+app:
+  experimental-clock-enabled: ${ENABLE_EXPERIMENTAL_CLOCK:true}
+  seed:
+    auto-on-startup: false
+    default-password: ${SEED_DEFAULT_PASSWORD:CampusLib#2026}
+  cloud:
+    mock-mode: ${HUAWEI_CLOUD_MOCK:true}
+    region: ${HUAWEI_CLOUD_REGION:cn-north-4}
+    monthly-budget-limit: ${CLOUD_MONTHLY_BUDGET_LIMIT:5000}

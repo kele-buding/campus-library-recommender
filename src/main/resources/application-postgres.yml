@@ -1,0 +1,10 @@
+# 目标部署与并发验收配置：使用 PostgreSQL 16
+spring:
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:127.0.0.1}:${DB_PORT:5432}/${DB_NAME:campus_library}
+    driver-class-name: org.postgresql.Driver
+    username: ${DB_USER:campus_library}
+    password: ${DB_PASSWORD:campus_library_dev}
+  flyway:
+    enabled: true
+    locations: classpath:db/migration/postgres
