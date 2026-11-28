@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>校园图书借阅系统</title>
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body data-page="home" data-roles="">
+<header class="topbar">
+  <div class="brand">校园图书借阅系统</div>
+  <nav id="nav"></nav>
+  <div id="who"></div>
+</header>
+<main>
+  <div class="card" id="panel"><div class="empty">正在确认身份…</div></div>
+</main>
+<div id="toast"></div>
+<script src="assets/app.js"></script>
+<script>
+(function () {
+  App.api('/api/auth/me').then(function (ctx) {
+    App.api('/api/auth/logout', { method: 'POST' }).then(function () {}, function () {});
+    var home = App.homeFor(ctx.role);
+    if (ctx.role !== 'buyer') { location.href = home; return; }
+    /* 采购员在第一周没有对应页面，第二周由 D-W2-1 提供采购建议页 */
+    document.getElementById('panel').innerHTML =
+      '<h1>采购员</h1>' +
+      '<p class="sub">采购建议页按计划在第二周交付（D-W2-1），本周暂无可用页面。</p>' +
+      '<a class="btn" href="login.html">退出登录</a>';
+  }).catch(function () {
+    location.href = 'login.html';
+  });
+})();
+</script>
+</body>
+</html>

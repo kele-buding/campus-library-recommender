@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>新书登记 · 校园图书借阅系统</title>
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body data-page="book-new" data-roles="librarian">
+<header class="topbar">
+  <div class="brand">校园图书借阅系统</div>
+  <nav id="nav"></nav>
+  <div id="who"></div>
+</header>
+<main>
+  <h1>新书登记</h1>
+  <p class="sub">仅图书馆管理员可登记；初始可借数量等于馆藏总数，版本从 1 开始。</p>
+
+  <div class="card">
+    <form id="form">
+      <div class="row">
+        <div class="field" style="flex:2">
+          <label for="title">书名</label>
+          <input id="title" required>
+        </div>
+        <div class="field" style="flex:1">
+          <label for="category">分类</label>
+          <input id="category" placeholder="如 计算机" required>
+        </div>
+        <div class="field" style="flex:1">
+          <label for="count">初始可借数量</label>
+          <input id="count" type="number" min="0" value="1" required>
+        </div>
+      </div>
+      <div style="margin-top:14px">
+        <button class="primary" id="submit" type="submit">登记</button>
+      </div>
+    </form>
+    <div class="note" id="result" style="display:none;margin:16px 0 0;border-left-color:#10b981;background:#ecfdf5;color:#047857"></div>
+  </div>
+</main>
+<div id="toast"></div>
+<script src="assets/app.js"></script>
+</body>
+</html>

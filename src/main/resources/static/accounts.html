@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>账号管理 · 校园图书借阅系统</title>
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body data-page="accounts" data-roles="sysadmin">
+<header class="topbar">
+  <div class="brand">校园图书借阅系统</div>
+  <nav id="nav"></nav>
+  <div id="who"></div>
+</header>
+<main>
+  <h1>账号管理</h1>
+  <p class="sub">仅系统管理员可访问；这里维护账号本身，不参与借还业务。</p>
+
+  <div class="card">
+    <h2>新增账号</h2>
+    <form id="form">
+      <div class="row">
+        <div class="field"><label for="loginName">登录名</label><input id="loginName" required></div>
+        <div class="field"><label for="password">初始密码</label><input id="password" type="password" required></div>
+        <div class="field">
+          <label for="role">角色</label>
+          <select id="role">
+            <option value="student">学生</option>
+            <option value="librarian">图书馆管理员</option>
+            <option value="buyer">采购员</option>
+            <option value="sysadmin">系统管理员</option>
+          </select>
+        </div>
+        <div class="field"><label for="major">专业</label><select id="major"></select></div>
+        <div class="field"><label for="displayCode">编号</label><input id="displayCode" placeholder="如 A7"></div>
+        <button class="primary" id="submit" type="submit">创建</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>账号列表</h2>
+    <div id="list"><div class="empty">加载中…</div></div>
+  </div>
+</main>
+<div id="toast"></div>
+<script src="assets/app.js"></script>
+</body>
+</html>

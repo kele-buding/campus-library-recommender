@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>馆藏检索 · 校园图书借阅系统</title>
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body data-page="catalog" data-roles="student,librarian">
+<header class="topbar">
+  <div class="brand">校园图书借阅系统</div>
+  <nav id="nav"></nav>
+  <div id="who"></div>
+</header>
+<main>
+  <h1>馆藏检索</h1>
+  <p class="sub">按书名关键词与分类筛选；学生可在此借出或预约。</p>
+
+  <div class="note" id="warn" style="display:none"></div>
+
+  <div class="card">
+    <form id="search" class="row">
+      <div class="field">
+        <label for="kw">书名关键词</label>
+        <input id="kw" placeholder="如 算法">
+      </div>
+      <div class="field">
+        <label for="cat">分类</label>
+        <input id="cat" placeholder="如 计算机">
+      </div>
+      <button class="primary" type="submit">查询</button>
+      <button type="button" id="reset">重置</button>
+    </form>
+  </div>
+
+  <div class="card" id="list"><div class="empty">加载中…</div></div>
+</main>
+<div id="toast"></div>
+<script src="assets/app.js"></script>
+</body>
+</html>

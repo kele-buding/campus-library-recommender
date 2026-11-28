@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 · 校园图书借阅系统</title>
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body data-page="login" data-roles="">
+<main>
+  <div class="login-wrap">
+    <div class="card">
+      <h1>校园图书借阅系统</h1>
+      <form id="form">
+        <div class="field">
+          <label for="loginName">登录名</label>
+          <input id="loginName" autocomplete="username" required>
+        </div>
+        <div class="field">
+          <label for="password">密码</label>
+          <input id="password" type="password" autocomplete="current-password" required>
+        </div>
+        <button class="primary" id="submit" style="width:100%">登录</button>
+      </form>
+      <div class="hint">
+        演示账号（密码 <code>CampusLib#2026</code>）：<br>
+        学生 <code>a1</code>～<code>a6</code>　图书馆管理员 <code>librarian</code><br>
+        采购员 <code>buyer</code>　系统管理员 <code>sysadmin</code>
+      </div>
+    </div>
+  </div>
+</main>
+<div id="toast"></div>
+<script src="assets/app.js"></script>
+<script>
+(function () {
+  var form = document.getElementById('form');
+  var btn = document.getElementById('submit');
+  var saved = null;
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    if (btn.disabled) { return; }                 /* 防重复连点 */
+    saved = App.lock(btn, '登录中…');
+    App.api('/api/auth/login', {
+      method: 'POST',
+      body: {
+        loginName: document.getElementById('loginName').value.trim(),
+        password: document.getElementById('password').value
+      }
+    }).then(function (ctx) {
+      location.href = App.homeFor(ctx.role);
+    }).catch(function (err) {
+      App.unlock(btn, saved);
+      App.toast('登录失败：' + err.message, 'err');
+    });
+  });
+
+  /* 已登录则直接进对应首页 */
+  App.api('/api/auth/me').then(function (ctx) {
+    location.href = App.homeFor(ctx.role);
+  }, function () { /* 未登录，停留在此页 */ });
+})();
+</script>
+</body>
+</html>

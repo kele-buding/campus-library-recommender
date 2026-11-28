@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>我的借阅与预约 · 校园图书借阅系统</title>
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body data-page="my-loans" data-roles="student">
+<header class="topbar">
+  <div class="brand">校园图书借阅系统</div>
+  <nav id="nav"></nav>
+  <div id="who"></div>
+</header>
+<main>
+  <h1>我的借阅与预约</h1>
+  <p class="sub">这里只显示当前登录学生本人的记录。</p>
+
+  <div class="card">
+    <h2>借阅记录</h2>
+    <div id="loans"><div class="empty">加载中…</div></div>
+  </div>
+
+  <div class="card">
+    <h2>我的预约</h2>
+    <div id="reservations"><div class="empty">加载中…</div></div>
+  </div>
+</main>
+<div id="toast"></div>
+<script src="assets/app.js"></script>
+</body>
+</html>
